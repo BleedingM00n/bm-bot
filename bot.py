@@ -5,7 +5,8 @@ import urllib.parse
 import urllib.request
 import gzip
 import zlib
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -24,17 +25,43 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 # Discord channel used for Minecraft commands
 MINE_BOT_CHANNEL_ID = 1546212814501322902
 
-# Plan API
-PLAN_API = "http://thala.ender.co.in:45801"
+# Plan API - UPDATED ENDERCLOUD ADDRESS
+PLAN_API = "http://agni.ender.co.in:45801"
 
 # Plan server UUID
 PLAN_SERVER_UUID = "b8bc0c5d-3735-4e95-8b7e-672fd1947580"
 
-# Local database
+# Databases
 DATABASE_FILE = "minecraft_links.db"
+ACTIVITY_DATABASE_FILE = "activity.db"
 
-# Leaderboard size
 LEADERBOARD_SIZE = 15
+
+# Text activity:
+# Each message can extend the active session by up to 10 minutes.
+TEXT_ACTIVITY_TIMEOUT_SECONDS = 10 * 60
+
+# Use India time for week/month boundaries.
+TIMEZONE = ZoneInfo("Asia/Kolkata")
+
+# Text levels are lifetime levels.
+TEXT_LEVELS = [
+    (1, 1),       # 1 hour
+    (2, 3),       # 3 hours
+    (3, 6),       # 6 hours
+    (4, 10),      # 10 hours
+    (5, 15),      # 15 hours
+    (6, 20),      # 20 hours
+    (7, 30),      # 30 hours
+    (8, 40),      # 40 hours
+    (9, 50),      # 50 hours
+    (10, 75),     # 75 hours
+    (11, 100),    # 100 hours
+    (12, 150),    # 150 hours
+    (13, 200),    # 200 hours
+    (14, 300),    # 300 hours
+    (15, 500),    # 500 hours
+]
 
 
 # ============================================================
@@ -42,6 +69,9 @@ LEADERBOARD_SIZE = 15
 # ============================================================
 
 intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+intents.voice_states = True
 
 bot = commands.Bot(
     command_prefix="!",
@@ -50,15 +80,21 @@ bot = commands.Bot(
 
 
 # ============================================================
-# DATABASE
+# GENERAL DATABASE HELPERS
 # ============================================================
 
-def initialize_database():
+def get_db(path):
+    connection = sqlite3.connect(path, timeout=30)
+    connection.execute("PRAGMA journal_mode=WAL")
+    return connection
 
-    connection = sqlite3.connect(
-        DATABASE_FILE
-    )
 
+# ============================================================
+# MINECRAFT DATABASE
+# ============================================================
+
+def initialize_minecraft_database():
+    connection = get_db(DATABASE_FILE)
     cursor = connection.cursor()
 
     cursor.execute(
@@ -75,14 +111,8 @@ def initialize_database():
     connection.close()
 
 
-def get_minecraft_link(
-    discord_user_id
-):
-
-    connection = sqlite3.connect(
-        DATABASE_FILE
-    )
-
+def get_minecraft_link(discord_user_id):
+    connection = get_db(DATABASE_FILE)
     cursor = connection.cursor()
 
     cursor.execute(
@@ -95,22 +125,13 @@ def get_minecraft_link(
     )
 
     result = cursor.fetchone()
-
     connection.close()
 
     return result
 
 
-def save_minecraft_link(
-    discord_user_id,
-    minecraft_uuid,
-    minecraft_name
-):
-
-    connection = sqlite3.connect(
-        DATABASE_FILE
-    )
-
+def save_minecraft_link(discord_user_id, minecraft_uuid, minecraft_name):
+    connection = get_db(DATABASE_FILE)
     cursor = connection.cursor()
 
     cursor.execute(
@@ -134,14 +155,8 @@ def save_minecraft_link(
     connection.close()
 
 
-def delete_minecraft_link(
-    discord_user_id
-):
-
-    connection = sqlite3.connect(
-        DATABASE_FILE
-    )
-
+def delete_minecraft_link(discord_user_id):
+    connection = get_db(DATABASE_FILE)
     cursor = connection.cursor()
 
     cursor.execute(
@@ -161,11 +176,651 @@ def delete_minecraft_link(
 
 
 # ============================================================
+# ACTIVITY DATABASE
+# ============================================================
+
+def initialize_activity_database():
+    connection = get_db(ACTIVITY_DATABASE_FILE)
+    cursor = connection.cursor()
+
+    # One row for every message that contributed text activity.
+    # credited_seconds is capped at 10 minutes.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS text_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_user_id INTEGER NOT NULL,
+            timestamp REAL NOT NULL,
+            credited_seconds INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_text_activity_user_time
+        ON text_activity(discord_user_id, timestamp)
+        """
+    )
+
+    # Last message timestamp is used to calculate the next text session.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS text_sessions (
+            discord_user_id INTEGER PRIMARY KEY,
+            last_message_timestamp REAL NOT NULL
+        )
+        """
+    )
+
+    # Voice sessions. end_timestamp is NULL while the user is currently
+    # in a voice channel.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS voice_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_user_id INTEGER NOT NULL,
+            start_timestamp REAL NOT NULL,
+            end_timestamp REAL
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_voice_sessions_user_time
+        ON voice_sessions(discord_user_id, start_timestamp)
+        """
+    )
+
+    connection.commit()
+    connection.close()
+
+
+# ============================================================
+# TIME HELPERS
+# ============================================================
+
+def now_utc_timestamp():
+    return datetime.now(timezone.utc).timestamp()
+
+
+def local_now():
+    return datetime.now(TIMEZONE)
+
+
+def get_week_start_timestamp():
+    now = local_now()
+
+    # Monday = 0
+    start = datetime(
+        now.year,
+        now.month,
+        now.day,
+        tzinfo=TIMEZONE
+    )
+
+    start = start.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
+
+    start = start.fromtimestamp(
+        start.timestamp() - start.weekday() * 86400,
+        tz=TIMEZONE
+    )
+
+    return start.timestamp()
+
+
+def get_month_start_timestamp():
+    now = local_now()
+
+    start = datetime(
+        now.year,
+        now.month,
+        1,
+        tzinfo=TIMEZONE
+    )
+
+    return start.timestamp()
+
+
+def get_month_name():
+    return local_now().strftime("%B %Y")
+
+
+def get_week_name():
+    return local_now().strftime("Week of %d %B %Y")
+
+
+# ============================================================
+# TEXT ACTIVITY
+# ============================================================
+
+def record_text_activity(discord_user_id, timestamp=None):
+    """
+    Option C:
+    - A message starts/continues a text activity session.
+    - Between consecutive messages, at most 10 minutes are credited.
+    - A gap longer than 10 minutes starts a new session.
+    - Activity is stored permanently, so lifetime data never resets.
+    """
+    if timestamp is None:
+        timestamp = now_utc_timestamp()
+
+    connection = get_db(ACTIVITY_DATABASE_FILE)
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT last_message_timestamp
+        FROM text_sessions
+        WHERE discord_user_id = ?
+        """,
+        (discord_user_id,)
+    )
+
+    row = cursor.fetchone()
+
+    credited_seconds = 0
+
+    if row is not None:
+        last_timestamp = float(row[0])
+        delta = timestamp - last_timestamp
+
+        if delta > 0:
+            credited_seconds = min(
+                int(delta),
+                TEXT_ACTIVITY_TIMEOUT_SECONDS
+            )
+
+    cursor.execute(
+        """
+        INSERT INTO text_activity
+        (
+            discord_user_id,
+            timestamp,
+            credited_seconds
+        )
+        VALUES (?, ?, ?)
+        """,
+        (
+            discord_user_id,
+            timestamp,
+            credited_seconds
+        )
+    )
+
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO text_sessions
+        (
+            discord_user_id,
+            last_message_timestamp
+        )
+        VALUES (?, ?)
+        """,
+        (
+            discord_user_id,
+            timestamp
+        )
+    )
+
+    connection.commit()
+    connection.close()
+
+    return credited_seconds
+
+
+def get_text_activity(
+    discord_user_id,
+    start_timestamp=None,
+    end_timestamp=None
+):
+    connection = get_db(ACTIVITY_DATABASE_FILE)
+    cursor = connection.cursor()
+
+    query = """
+        SELECT COALESCE(SUM(credited_seconds), 0)
+        FROM text_activity
+        WHERE discord_user_id = ?
+    """
+
+    params = [discord_user_id]
+
+    if start_timestamp is not None:
+        query += " AND timestamp >= ?"
+        params.append(start_timestamp)
+
+    if end_timestamp is not None:
+        query += " AND timestamp < ?"
+        params.append(end_timestamp)
+
+    cursor.execute(query, params)
+
+    result = cursor.fetchone()
+    connection.close()
+
+    return int(result[0] or 0)
+
+
+def get_all_text_users():
+    connection = get_db(ACTIVITY_DATABASE_FILE)
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT DISTINCT discord_user_id
+        FROM text_activity
+        """
+    )
+
+    users = [int(row[0]) for row in cursor.fetchall()]
+    connection.close()
+
+    return users
+
+
+# ============================================================
+# TEXT LEVELS
+# ============================================================
+
+def get_text_level(total_seconds):
+    total_hours = total_seconds / 3600
+
+    current_level = 0
+
+    for level, required_hours in TEXT_LEVELS:
+        if total_hours >= required_hours:
+            current_level = level
+        else:
+            break
+
+    return current_level
+
+
+def get_next_text_level(current_level):
+    for level, required_hours in TEXT_LEVELS:
+        if level > current_level:
+            return level, required_hours
+
+    return None
+
+
+def format_seconds(seconds):
+    seconds = max(0, int(seconds))
+
+    days = seconds // 86400
+    seconds %= 86400
+
+    hours = seconds // 3600
+    seconds %= 3600
+
+    minutes = seconds // 60
+
+    parts = []
+
+    if days:
+        parts.append(f"{days}d")
+
+    if hours:
+        parts.append(f"{hours}h")
+
+    if minutes:
+        parts.append(f"{minutes}m")
+
+    if not parts:
+        parts.append("0m")
+
+    return " ".join(parts)
+
+
+# ============================================================
+# TEXT LEVEL ROLES
+# ============================================================
+
+def text_level_role_name(level):
+    return f"Text Level {level}"
+
+
+async def get_or_create_text_level_role(guild, level):
+    if level <= 0:
+        return None
+
+    role_name = text_level_role_name(level)
+
+    role = discord.utils.get(
+        guild.roles,
+        name=role_name
+    )
+
+    if role:
+        return role
+
+    try:
+        role = await guild.create_role(
+            name=role_name,
+            reason="Bleeding Moon text activity level"
+        )
+        print(f"✅ Created Discord role: {role_name}")
+        return role
+
+    except discord.Forbidden:
+        print(
+            f"❌ Cannot create {role_name}. "
+            "Give the bot Manage Roles permission."
+        )
+        return None
+
+    except Exception as error:
+        print(
+            f"❌ Error creating {role_name}: {error}"
+        )
+        return None
+
+
+async def update_text_level_role(member):
+    """
+    Text levels are lifetime-based.
+    The bot keeps only the player's current Text Level role.
+    """
+    if member.bot:
+        return
+
+    total_seconds = get_text_activity(member.id)
+    level = get_text_level(total_seconds)
+
+    if level <= 0:
+        return
+
+    role = await get_or_create_text_level_role(
+        member.guild,
+        level
+    )
+
+    if role is None:
+        return
+
+    # Remove other Text Level roles.
+    roles_to_remove = []
+
+    for existing_role in member.roles:
+        if (
+            existing_role.name.startswith("Text Level ")
+            and existing_role != role
+        ):
+            roles_to_remove.append(existing_role)
+
+    try:
+        if roles_to_remove:
+            await member.remove_roles(
+                *roles_to_remove,
+                reason="Bleeding Moon text level update"
+            )
+
+        if role not in member.roles:
+            await member.add_roles(
+                role,
+                reason="Bleeding Moon text level update"
+            )
+
+    except discord.Forbidden:
+        print(
+            f"❌ Cannot update Text Level role for {member}"
+        )
+
+    except Exception as error:
+        print(
+            f"❌ Error updating Text Level role for {member}: {error}"
+        )
+
+
+# ============================================================
+# VOICE ACTIVITY
+# ============================================================
+
+def start_voice_session(discord_user_id):
+    timestamp = now_utc_timestamp()
+
+    connection = get_db(ACTIVITY_DATABASE_FILE)
+    cursor = connection.cursor()
+
+    # Avoid duplicate open sessions.
+    cursor.execute(
+        """
+        SELECT id
+        FROM voice_sessions
+        WHERE discord_user_id = ?
+        AND end_timestamp IS NULL
+        ORDER BY start_timestamp DESC
+        LIMIT 1
+        """,
+        (discord_user_id,)
+    )
+
+    if cursor.fetchone() is None:
+        cursor.execute(
+            """
+            INSERT INTO voice_sessions
+            (
+                discord_user_id,
+                start_timestamp,
+                end_timestamp
+            )
+            VALUES (?, ?, NULL)
+            """,
+            (
+                discord_user_id,
+                timestamp
+            )
+        )
+
+    connection.commit()
+    connection.close()
+
+
+def end_voice_session(discord_user_id):
+    timestamp = now_utc_timestamp()
+
+    connection = get_db(ACTIVITY_DATABASE_FILE)
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT id
+        FROM voice_sessions
+        WHERE discord_user_id = ?
+        AND end_timestamp IS NULL
+        ORDER BY start_timestamp DESC
+        LIMIT 1
+        """,
+        (discord_user_id,)
+    )
+
+    row = cursor.fetchone()
+
+    if row is not None:
+        cursor.execute(
+            """
+            UPDATE voice_sessions
+            SET end_timestamp = ?
+            WHERE id = ?
+            """,
+            (
+                timestamp,
+                row[0]
+            )
+        )
+
+    connection.commit()
+    connection.close()
+
+
+def calculate_voice_overlap(
+    start_timestamp,
+    end_timestamp,
+    period_start,
+    period_end
+):
+    actual_end = (
+        end_timestamp
+        if end_timestamp is not None
+        else now_utc_timestamp()
+    )
+
+    overlap_start = max(
+        start_timestamp,
+        period_start
+    )
+
+    overlap_end = min(
+        actual_end,
+        period_end
+    )
+
+    if overlap_end <= overlap_start:
+        return 0
+
+    return int(overlap_end - overlap_start)
+
+
+def get_voice_activity(
+    discord_user_id,
+    period_start=None,
+    period_end=None
+):
+    if period_start is None:
+        period_start = 0
+
+    if period_end is None:
+        period_end = now_utc_timestamp()
+
+    connection = get_db(ACTIVITY_DATABASE_FILE)
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT start_timestamp, end_timestamp
+        FROM voice_sessions
+        WHERE discord_user_id = ?
+        AND start_timestamp < ?
+        AND (
+            end_timestamp IS NULL
+            OR end_timestamp > ?
+        )
+        """,
+        (
+            discord_user_id,
+            period_end,
+            period_start
+        )
+    )
+
+    total = 0
+
+    for start_timestamp, end_timestamp in cursor.fetchall():
+        total += calculate_voice_overlap(
+            float(start_timestamp),
+            (
+                float(end_timestamp)
+                if end_timestamp is not None
+                else None
+            ),
+            period_start,
+            period_end
+        )
+
+    connection.close()
+
+    return total
+
+
+def get_all_voice_users():
+    connection = get_db(ACTIVITY_DATABASE_FILE)
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT DISTINCT discord_user_id
+        FROM voice_sessions
+        """
+    )
+
+    users = [int(row[0]) for row in cursor.fetchall()]
+    connection.close()
+
+    return users
+
+
+# ============================================================
+# DISCORD VOICE STATE
+# ============================================================
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.bot:
+        return
+
+    was_in_voice = before.channel is not None
+    is_in_voice = after.channel is not None
+
+    # Joined voice.
+    if not was_in_voice and is_in_voice:
+        start_voice_session(member.id)
+        print(
+            f"🎙️ Voice started: {member} -> {after.channel}"
+        )
+
+    # Left voice completely.
+    elif was_in_voice and not is_in_voice:
+        end_voice_session(member.id)
+        print(
+            f"🎙️ Voice ended: {member}"
+        )
+
+
+# ============================================================
+# DISCORD MESSAGE ACTIVITY
+# ============================================================
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    if message.guild is None:
+        return
+
+    try:
+        credited = record_text_activity(
+            message.author.id
+        )
+
+        # Only check/update the role when new activity was credited.
+        # This avoids unnecessary Discord API calls.
+        if credited > 0:
+            await update_text_level_role(
+                message.author
+            )
+
+    except Exception as error:
+        print(
+            f"❌ Text activity error for "
+            f"{message.author}: {error}"
+        )
+
+    # Keep normal command processing available.
+    await bot.process_commands(message)
+
+
+# ============================================================
 # PLAN API
 # ============================================================
 
 def plan_get(path):
-
     url = f"{PLAN_API}{path}"
 
     request = urllib.request.Request(
@@ -189,30 +844,17 @@ def plan_get(path):
             ""
         ).lower()
 
-        # Handle gzip
         if content_encoding == "gzip":
+            data = gzip.decompress(data)
 
-            data = gzip.decompress(
-                data
-            )
-
-        # Handle deflate
         elif content_encoding == "deflate":
+            data = zlib.decompress(data)
 
-            data = zlib.decompress(
-                data
-            )
-
-        # Some servers return gzip data
-        # without setting Content-Encoding.
         elif (
             len(data) >= 2
             and data[:2] == b"\x1f\x8b"
         ):
-
-            data = gzip.decompress(
-                data
-            )
+            data = gzip.decompress(data)
 
     return json.loads(
         data.decode("utf-8")
@@ -224,7 +866,6 @@ def plan_get(path):
 # ============================================================
 
 def get_plan_players():
-
     query = urllib.parse.urlencode(
         {
             "server": PLAN_SERVER_UUID
@@ -241,7 +882,6 @@ def get_plan_players():
 # ============================================================
 
 def extract_players(data):
-
     players = []
 
     if isinstance(data, dict):
@@ -254,7 +894,6 @@ def extract_players(data):
             possible_players,
             list
         ):
-
             for player in possible_players:
 
                 if not isinstance(
@@ -267,13 +906,11 @@ def extract_players(data):
                     "playerUUID" in player
                     and "playerName" in player
                 ):
-
                     players.append(
                         player
                     )
 
             if players:
-
                 return players
 
         for value in data.values():
@@ -282,13 +919,11 @@ def extract_players(data):
                 value,
                 (dict, list)
             ):
-
                 found = extract_players(
                     value
                 )
 
                 if found:
-
                     players.extend(
                         found
                     )
@@ -301,26 +936,22 @@ def extract_players(data):
                 item,
                 dict
             ):
-
                 continue
 
             if (
                 "playerUUID" in item
                 and "playerName" in item
             ):
-
                 players.append(
                     item
                 )
 
             else:
-
                 found = extract_players(
                     item
                 )
 
                 if found:
-
                     players.extend(
                         found
                     )
@@ -332,18 +963,10 @@ def extract_players(data):
 # CLEAN FLOODGATE / PLAN PLAYER NAME
 # ============================================================
 
-def clean_minecraft_name(
-    name
-):
+def clean_minecraft_name(name):
+    name = str(name).strip()
 
-    name = str(
-        name
-    ).strip()
-
-    # Plan stores Floodgate players with
-    # a leading dot.
     if name.startswith("."):
-
         name = name[1:]
 
     return name
@@ -353,10 +976,7 @@ def clean_minecraft_name(
 # FIND PLAYER IN PLAN
 # ============================================================
 
-def find_plan_player(
-    minecraft_name
-):
-
+def find_plan_player(minecraft_name):
     data = get_plan_players()
 
     players = extract_players(
@@ -386,44 +1006,22 @@ def find_plan_player(
         )
 
         if player_name.lower() == wanted_name:
-
             return player
 
         if nickname.lower() == wanted_name:
-
             return player
 
     return None
 
 
 # ============================================================
-# CURRENT MONTH
+# MINECRAFT MONTHLY PLAYTIME
 # ============================================================
 
-def get_current_month():
-
-    now = datetime.now()
-
-    return now.year, now.month
-
-
-def get_month_name():
-
-    now = datetime.now()
-
-    return now.strftime(
-        "%B %Y"
-    )
-
-
 def get_month_start_millis():
-
-    now = datetime.now()
-
-    month_start = datetime(
-        now.year,
-        now.month,
-        1
+    month_start = datetime.fromtimestamp(
+        get_month_start_timestamp(),
+        tz=timezone.utc
     )
 
     return int(
@@ -431,17 +1029,8 @@ def get_month_start_millis():
     )
 
 
-# ============================================================
-# GET MONTHLY PLAYTIME
-# ============================================================
-
-def get_monthly_playtime(
-    player_uuid
-):
-
-    month_start = (
-        get_month_start_millis()
-    )
+def get_monthly_playtime(player_uuid):
+    month_start = get_month_start_millis()
 
     query = urllib.parse.urlencode(
         {
@@ -464,80 +1053,44 @@ def get_monthly_playtime(
 
 
 # ============================================================
-# FORMAT PLAYTIME
+# FORMAT MINECRAFT PLAYTIME
 # ============================================================
 
-def format_playtime(
-    milliseconds
-):
+def format_playtime(milliseconds):
+    total_seconds = milliseconds // 1000
 
-    total_seconds = (
-        milliseconds // 1000
-    )
-
-    days = (
-        total_seconds // 86400
-    )
-
+    days = total_seconds // 86400
     total_seconds %= 86400
 
-    hours = (
-        total_seconds // 3600
-    )
-
+    hours = total_seconds // 3600
     total_seconds %= 3600
 
-    minutes = (
-        total_seconds // 60
-    )
-
-    seconds = (
-        total_seconds % 60
-    )
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
 
     parts = []
 
     if days:
-
-        parts.append(
-            f"{days}d"
-        )
+        parts.append(f"{days}d")
 
     if hours:
-
-        parts.append(
-            f"{hours}h"
-        )
+        parts.append(f"{hours}h")
 
     if minutes:
-
-        parts.append(
-            f"{minutes}m"
-        )
+        parts.append(f"{minutes}m")
 
     if seconds or not parts:
+        parts.append(f"{seconds}s")
 
-        parts.append(
-            f"{seconds}s"
-        )
-
-    return " ".join(
-        parts
-    )
+    return " ".join(parts)
 
 
 # ============================================================
 # CHECK MINECRAFT CHANNEL
 # ============================================================
 
-async def check_mine_bot_channel(
-    interaction
-):
-
-    if (
-        interaction.channel_id
-        != MINE_BOT_CHANNEL_ID
-    ):
+async def check_mine_bot_channel(interaction):
+    if interaction.channel_id != MINE_BOT_CHANNEL_ID:
 
         await interaction.response.send_message(
             "❌ Minecraft commands can only be used in "
@@ -554,13 +1107,8 @@ async def check_mine_bot_channel(
 # CHECK ADMIN / MODERATOR
 # ============================================================
 
-def is_moderator(
-    member
-):
-
-    permissions = (
-        member.guild_permissions
-    )
+def is_moderator(member):
+    permissions = member.guild_permissions
 
     return (
         permissions.administrator
@@ -575,13 +1123,19 @@ def is_moderator(
 
 @bot.event
 async def on_ready():
-
     print(
         f"🌙 Bleeding Moon is online as {bot.user}"
     )
 
-    try:
+    print(
+        f"⛏️ Plan API: {PLAN_API}"
+    )
 
+    print(
+        f"🌏 Activity timezone: {TIMEZONE.key}"
+    )
+
+    try:
         synced = await bot.tree.sync()
 
         print(
@@ -589,7 +1143,6 @@ async def on_ready():
         )
 
     except Exception as error:
-
         print(
             f"❌ Failed to sync commands: {error}"
         )
@@ -616,7 +1169,6 @@ async def link_player(
     if not await check_mine_bot_channel(
         interaction
     ):
-
         return
 
     if not is_moderator(
@@ -635,7 +1187,6 @@ async def link_player(
     )
 
     try:
-
         player = await bot.loop.run_in_executor(
             None,
             find_plan_player,
@@ -643,7 +1194,6 @@ async def link_player(
         )
 
     except Exception as error:
-
         print(
             f"❌ Plan API error while linking player: {error}"
         )
@@ -720,7 +1270,6 @@ async def unlink_player(
     if not await check_mine_bot_channel(
         interaction
     ):
-
         return
 
     if not is_moderator(
@@ -762,7 +1311,7 @@ async def unlink_player(
 
 
 # ============================================================
-# MONTHLY PLAYTIME
+# MINECRAFT MONTHLY PLAYTIME
 # ============================================================
 
 @bot.tree.command(
@@ -780,13 +1329,9 @@ async def playtime(
     if not await check_mine_bot_channel(
         interaction
     ):
-
         return
 
-    target = (
-        member
-        or interaction.user
-    )
+    target = member or interaction.user
 
     link = get_minecraft_link(
         target.id
@@ -807,7 +1352,6 @@ async def playtime(
     await interaction.response.defer()
 
     try:
-
         milliseconds = await bot.loop.run_in_executor(
             None,
             get_monthly_playtime,
@@ -815,7 +1359,6 @@ async def playtime(
         )
 
     except Exception as error:
-
         print(
             f"❌ Plan API error while getting monthly playtime: {error}"
         )
@@ -866,7 +1409,7 @@ async def playtime(
 
 
 # ============================================================
-# MONTHLY TOP 15 LEADERBOARD
+# MINECRAFT MONTHLY TOP 15
 # ============================================================
 
 @bot.tree.command(
@@ -880,13 +1423,11 @@ async def playtime_top(
     if not await check_mine_bot_channel(
         interaction
     ):
-
         return
 
     await interaction.response.defer()
 
     try:
-
         data = await bot.loop.run_in_executor(
             None,
             get_plan_players
@@ -897,7 +1438,6 @@ async def playtime_top(
         )
 
     except Exception as error:
-
         print(
             f"❌ Plan API error while getting players: {error}"
         )
@@ -908,7 +1448,6 @@ async def playtime_top(
 
         return
 
-    # Remove duplicate UUIDs
     unique_players = {}
 
     for player in players:
@@ -917,21 +1456,14 @@ async def playtime_top(
             "playerUUID"
         )
 
-        if not player_uuid:
-
-            continue
-
-        unique_players[
-            player_uuid
-        ] = player
+        if player_uuid:
+            unique_players[
+                player_uuid
+            ] = player
 
     players = list(
         unique_players.values()
     )
-
-    # ========================================================
-    # GET MONTHLY PLAYTIME FOR EVERY PLAYER
-    # ========================================================
 
     monthly_players = []
 
@@ -942,7 +1474,6 @@ async def playtime_top(
         )
 
         try:
-
             monthly_playtime = (
                 await bot.loop.run_in_executor(
                     None,
@@ -952,15 +1483,12 @@ async def playtime_top(
             )
 
         except Exception as error:
-
             print(
                 f"❌ Failed to get monthly playtime for "
                 f"{player.get('playerName', 'Unknown')}: {error}"
             )
-
             continue
 
-        # Only include players who have played this month
         if monthly_playtime > 0:
 
             monthly_players.append(
@@ -969,10 +1497,6 @@ async def playtime_top(
                     "playtime": monthly_playtime
                 }
             )
-
-    # ========================================================
-    # SORT BY MONTHLY PLAYTIME
-    # ========================================================
 
     monthly_players.sort(
         key=lambda item: item["playtime"],
@@ -992,10 +1516,6 @@ async def playtime_top(
 
         return
 
-    # ========================================================
-    # BUILD LEADERBOARD
-    # ========================================================
-
     lines = []
 
     medals = {
@@ -1010,7 +1530,6 @@ async def playtime_top(
     ):
 
         player = item["player"]
-
         playtime = item["playtime"]
 
         minecraft_name = clean_minecraft_name(
@@ -1029,10 +1548,6 @@ async def playtime_top(
             f"{prefix} **{minecraft_name}** — "
             f"`{format_playtime(playtime)}`"
         )
-
-    # ========================================================
-    # EMBED
-    # ========================================================
 
     month_name = get_month_name()
 
@@ -1059,17 +1574,377 @@ async def playtime_top(
 
 
 # ============================================================
+# TEXT LEVEL
+# ============================================================
+
+@bot.tree.command(
+    name="text-level",
+    description="Show a member's lifetime text level."
+)
+@app_commands.describe(
+    member="Optional Discord member"
+)
+async def text_level(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None
+):
+
+    target = member or interaction.user
+
+    total_seconds = get_text_activity(
+        target.id
+    )
+
+    level = get_text_level(
+        total_seconds
+    )
+
+    embed = discord.Embed(
+        title="🌙  BLEEDING MOON",
+        description="## ✦  TEXT LEVEL",
+        color=discord.Color.from_rgb(
+            88,
+            52,
+            120
+        )
+    )
+
+    if level <= 0:
+        embed.add_field(
+            name="Current Level",
+            value="**Level 0**",
+            inline=False
+        )
+
+        first_level, first_hours = TEXT_LEVELS[0]
+
+        embed.add_field(
+            name="Next Level",
+            value=f"Level {first_level} at {first_hours}h",
+            inline=False
+        )
+
+    else:
+        embed.add_field(
+            name="Current Level",
+            value=f"**Level {level}**",
+            inline=True
+        )
+
+        embed.add_field(
+            name="Lifetime Activity",
+            value=f"**{format_seconds(total_seconds)}**",
+            inline=True
+        )
+
+        next_level = get_next_text_level(level)
+
+        if next_level:
+            next_level_number, required_hours = next_level
+
+            remaining_seconds = max(
+                0,
+                int(required_hours * 3600) - total_seconds
+            )
+
+            embed.add_field(
+                name=f"Next Level — {next_level_number}",
+                value=(
+                    f"**{format_seconds(remaining_seconds)}** remaining"
+                ),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="Status",
+                value="🏆 **Maximum Level Reached**",
+                inline=False
+            )
+
+    embed.set_footer(
+        text="Text level is lifetime-based and never resets."
+    )
+
+    await interaction.response.send_message(
+        embed=embed
+    )
+
+
+# ============================================================
+# TEXT LEADERBOARD
+# ============================================================
+
+def get_text_period(period):
+    now = local_now()
+    current_timestamp = now.timestamp()
+
+    if period == "week":
+        return (
+            get_week_start_timestamp(),
+            current_timestamp,
+            get_week_name()
+        )
+
+    if period == "month":
+        return (
+            get_month_start_timestamp(),
+            current_timestamp,
+            get_month_name()
+        )
+
+    return (
+        0,
+        current_timestamp,
+        "LIFETIME"
+    )
+
+
+@bot.tree.command(
+    name="text-top",
+    description="Show the text activity leaderboard."
+)
+@app_commands.describe(
+    period="Leaderboard period"
+)
+@app_commands.choices(
+    period=[
+        app_commands.Choice(
+            name="Week",
+            value="week"
+        ),
+        app_commands.Choice(
+            name="Month",
+            value="month"
+        ),
+        app_commands.Choice(
+            name="Lifetime",
+            value="lifetime"
+        )
+    ]
+)
+async def text_top(
+    interaction: discord.Interaction,
+    period: app_commands.Choice[str]
+):
+
+    await interaction.response.defer()
+
+    start_timestamp, end_timestamp, period_name = get_text_period(
+        period.value
+    )
+
+    user_ids = get_all_text_users()
+
+    leaderboard = []
+
+    for user_id in user_ids:
+
+        seconds = get_text_activity(
+            user_id,
+            start_timestamp,
+            end_timestamp
+        )
+
+        if seconds > 0:
+            leaderboard.append(
+                (
+                    user_id,
+                    seconds
+                )
+            )
+
+    leaderboard.sort(
+        key=lambda item: item[1],
+        reverse=True
+    )
+
+    leaderboard = leaderboard[
+        :LEADERBOARD_SIZE
+    ]
+
+    if not leaderboard:
+        await interaction.followup.send(
+            f"❌ No text activity has been recorded for **{period_name}** yet."
+        )
+        return
+
+    lines = []
+
+    medals = {
+        1: "🥇",
+        2: "🥈",
+        3: "🥉"
+    }
+
+    for position, (user_id, seconds) in enumerate(
+        leaderboard,
+        start=1
+    ):
+
+        member = interaction.guild.get_member(
+            user_id
+        )
+
+        if member:
+            name = member.display_name
+            mention = member.mention
+        else:
+            name = f"User {user_id}"
+            mention = name
+
+        prefix = medals.get(
+            position,
+            f"`{position:02d}`"
+        )
+
+        lines.append(
+            f"{prefix} {mention} — **{format_seconds(seconds)}**"
+        )
+
+    embed = discord.Embed(
+        title=f"💬  {period_name.upper()}",
+        description=(
+            "## ✦  TEXT ACTIVITY LEADERBOARD\n\n"
+            + "\n".join(lines)
+        ),
+        color=discord.Color.from_rgb(
+            88,
+            52,
+            120
+        )
+    )
+
+    embed.set_footer(
+        text="Top 15  •  Text activity"
+    )
+
+    await interaction.followup.send(
+        embed=embed
+    )
+
+
+# ============================================================
+# VOICE MONTHLY LEADERBOARD
+# ============================================================
+
+@bot.tree.command(
+    name="voice-top",
+    description="Show the top 15 voice users for this month."
+)
+async def voice_top(
+    interaction: discord.Interaction
+):
+
+    await interaction.response.defer()
+
+    month_start = get_month_start_timestamp()
+    current_timestamp = now_utc_timestamp()
+
+    user_ids = get_all_voice_users()
+
+    leaderboard = []
+
+    for user_id in user_ids:
+
+        seconds = get_voice_activity(
+            user_id,
+            month_start,
+            current_timestamp
+        )
+
+        if seconds > 0:
+            leaderboard.append(
+                (
+                    user_id,
+                    seconds
+                )
+            )
+
+    leaderboard.sort(
+        key=lambda item: item[1],
+        reverse=True
+    )
+
+    leaderboard = leaderboard[
+        :LEADERBOARD_SIZE
+    ]
+
+    month_name = get_month_name()
+
+    if not leaderboard:
+        await interaction.followup.send(
+            f"❌ No voice activity has been recorded for **{month_name}** yet."
+        )
+        return
+
+    lines = []
+
+    medals = {
+        1: "🥇",
+        2: "🥈",
+        3: "🥉"
+    }
+
+    for position, (user_id, seconds) in enumerate(
+        leaderboard,
+        start=1
+    ):
+
+        member = interaction.guild.get_member(
+            user_id
+        )
+
+        if member:
+            mention = member.mention
+        else:
+            mention = f"User {user_id}"
+
+        prefix = medals.get(
+            position,
+            f"`{position:02d}`"
+        )
+
+        lines.append(
+            f"{prefix} {mention} — **{format_seconds(seconds)}**"
+        )
+
+    embed = discord.Embed(
+        title=f"🎙️  {month_name.upper()}",
+        description=(
+            "## ✦  VOICE ACTIVITY LEADERBOARD\n\n"
+            + "\n".join(lines)
+        ),
+        color=discord.Color.from_rgb(
+            88,
+            52,
+            120
+        )
+    )
+
+    embed.set_footer(
+        text=f"Top 15  •  {month_name}  •  Voice activity"
+    )
+
+    await interaction.followup.send(
+        embed=embed
+    )
+
+
+# ============================================================
+# INITIALIZE DATABASES
+# ============================================================
+
+initialize_minecraft_database()
+initialize_activity_database()
+
+
+# ============================================================
 # START BOT
 # ============================================================
 
-initialize_database()
-
-
 if not TOKEN:
-
     raise RuntimeError(
         "DISCORD_TOKEN was not found in .env"
     )
-
 
 bot.run(TOKEN)
