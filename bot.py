@@ -26,7 +26,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 MINE_BOT_CHANNEL_ID = 1546212814501322902
 
 # Plan API - UPDATED ENDERCLOUD ADDRESS
-PLAN_API = "http://agni.ender.co.in:45801"
+PLAN_API = "http://agni.ender.co.in:45882"
 
 # Plan server UUID
 PLAN_SERVER_UUID = "b8bc0c5d-3735-4e95-8b7e-672fd1947580"
